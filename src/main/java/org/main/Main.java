@@ -1,0 +1,1520 @@
+package org.main;
+
+import common.types.ChannelAddress;
+import predictor.lstm.common.HyperParameters;
+import predictor.lstm.common.LstmPredictor;
+import predictor.lstm.common.ReadAndSaveModels;
+import predictor.lstm.common.LstmPredictorImproved;
+import predictor.lstm.data.TimeSeriesData;
+import predictor.lstm.interpolation.InterpolationManager;
+import predictor.lstm.io.CsvDataReader;
+import predictor.lstm.performance.PerformanceMatrix;
+import predictor.lstm.preprocessing.TimeIndexRegularizer;
+import predictor.lstm.train.LstmTrain;
+import predictor.lstm.train.LstmTrainImproved;
+import predictor.lstm.train.forgetgate.LstmTrainWithForgetGate;
+import predictor.lstm.utilities.DataUtility;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Scanner;
+
+public class Main {
+
+    public static void main(String[] args) {
+
+        try (Scanner scanner = new Scanner(System.in)) {
+
+            while (true) {
+
+                System.out.println("\nLSTM Time Series Predictor");
+                System.out.println("--------------------------");
+                System.out.println("1. Train a new model");
+                System.out.println("2. Train model sequentially (T1-T9)");
+                System.out.println("3. Make a short-term prediction");
+                System.out.println("4. Predict for next month (Projection)");
+                System.out.println("5. Train with sliding window (45-day batches, 7-day slide)");
+                System.out.println("6. Make a Combined Prediction (Improved)");
+                System.out.println("7. Exit");
+                System.out.println("8. Train model with Improved Algorithm (Review Fixes)");
+                System.out.println("9. Train with sliding window (Improved Algorithm)");
+                System.out.println("10. Make a Combined Prediction (Improved Algorithm)");
+                System.out.println("11. Train model with Forget Gate (New Architecture)");
+                System.out.println("12. Train with sliding window (Forget Gate)");
+                System.out.print("Select an option: ");
+
+                String choice = scanner.nextLine();
+
+                switch (choice) {
+                    case "1":
+                        trainModel(scanner);
+                        break;
+                    case "2":
+                        trainSequentialMonths(scanner);
+                        break;
+                    case "3":
+                        predict(scanner);
+                        break;
+                    case "4":
+                        predictMonth(scanner);
+                        break;
+                    case "5":
+                        trainWithSlidingWindow(scanner);
+                        break;
+                    case "6":
+                        predictCombined(scanner);
+                        break;
+                    case "7":
+                        System.out.println("Exiting...");
+                        return;
+                    case "8":
+                        trainModelImproved(scanner);
+                        break;
+                    case "9":
+                        trainWithSlidingWindowImproved(scanner);
+                        break;
+                    case "10":
+                        predictCombinedImproved(scanner);
+                        break;
+                    case "11":
+                        trainModelWithForgetGate(scanner);
+                        break;
+                    case "12":
+                        trainWithSlidingWindowWithForgetGate(scanner);
+                        break;
+                    default:
+                        System.out.println("Invalid option. Please try again.");
+                }
+            }
+        }
+    }
+
+    private static void predictCombined(Scanner scanner) {
+        System.out.print("Enter the name of the model to use: ");
+        String modelName = scanner.nextLine();
+
+        System.out.print("Enter path to the input CSV file for prediction context: ");
+        String filePath = scanner.nextLine();
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        try {
+            HyperParameters hyperParameters = ReadAndSaveModels.read(modelName);
+            if (hyperParameters.getCount() == 0) {
+                System.out.println("Model has not been trained yet. Please train the model first.");
+                return;
+            }
+
+            CsvDataReader reader = new CsvDataReader();
+            TimeSeriesData allInputData = reader.read(filePath);
+
+            if (allInputData.dates().isEmpty()) {
+                System.out.println("Input data is empty. Cannot make a prediction.");
+                return;
+            }
+
+            OffsetDateTime till = allInputData.dates().get(allInputData.dates().size() - 1);
+
+            // 1. Precisely slice data and get Trend Prediction
+            System.out.println("\n--- Trend Prediction ---");
+            OffsetDateTime trendFrom = till.minusMinutes((long) hyperParameters.getInterval() * hyperParameters.getWindowSizeTrend());
+            TimeSeriesData trendInput = filterDataByDateRange(allInputData, trendFrom, till);
+            System.out.println("Slicing data for Trend from " + trendFrom.toLocalDate() + " to " + till.toLocalDate() + ". Using " + trendInput.values().size() + " data points.");
+
+            ArrayList<Double> trendPrediction = LstmPredictor.predictTrend(
+                    trendInput.values(),
+                    trendInput.dates(),
+                    till.atZoneSameInstant(ZoneId.systemDefault()),
+                    hyperParameters);
+            System.out.println("Predicted trend values (first 10): " + trendPrediction.subList(0, Math.min(10, trendPrediction.size())));
+
+            // 2. Precisely slice data and get Seasonality Prediction
+            System.out.println("\n--- Seasonality Prediction ---");
+            OffsetDateTime seasonalityFrom = till.minusDays((long)hyperParameters.getWindowSizeSeasonality() - 1);
+            TimeSeriesData seasonalityInput = filterDataByDateRange(allInputData, seasonalityFrom, till);
+            System.out.println("Slicing data for Seasonality from " + seasonalityFrom.toLocalDate() + " to " + till.toLocalDate() + ". Using " + seasonalityInput.values().size() + " data points.");
+
+            ArrayList<Double> seasonalityPrediction = LstmPredictor.predictSeasonality(
+                    seasonalityInput.values(),
+                    seasonalityInput.dates(),
+                    hyperParameters);
+
+            // 3. Arrange the seasonality prediction to align it correctly in time
+            OffsetDateTime targetFrom = till.plusMinutes(hyperParameters.getInterval());
+            int splitIndex = LstmPredictor.getIndex(targetFrom.getHour(), targetFrom.getMinute(), hyperParameters);
+            ArrayList<Double> arrangedSeasonality = LstmPredictor.getArranged(splitIndex, seasonalityPrediction);
+            System.out.println("Arranged seasonality values (first 10): " + arrangedSeasonality.subList(0, Math.min(10, arrangedSeasonality.size())));
+
+
+            // 4. Combine Trend and Arranged Seasonality using the correct utility
+            ArrayList<Double> combinedPrediction = DataUtility.combine(trendPrediction, arrangedSeasonality);
+            System.out.println("\n--- Combined Final Prediction ---");
+            System.out.println("Final predicted values (first 10): " + combinedPrediction.subList(0, Math.min(10, combinedPrediction.size())));
+            System.out.println("Total predicted points: " + combinedPrediction.size());
+
+            // 5. Performance Evaluation (NEW)
+            System.out.print("\nEnter path to validation/target CSV file to evaluate performance (or press Enter to skip): ");
+            String targetFilePath = scanner.nextLine();
+
+            if (targetFilePath != null && !targetFilePath.trim().isEmpty()) {
+                if (!targetFilePath.contains(":\\") && !targetFilePath.startsWith("/")) {
+                    targetFilePath = "D:\\GGP\\LSTM_Java\\" + targetFilePath;
+                }
+                
+                System.out.println("\n--- Performance Evaluation ---");
+                try {
+                    OffsetDateTime predictionEnd = targetFrom.plusMinutes((long) hyperParameters.getInterval() * (combinedPrediction.size() -1));
+                    ArrayList<Double> targetData = getTargetDataForPrediction(targetFrom, predictionEnd.plusMinutes(1), targetFilePath, hyperParameters);
+
+                    if (targetData.size() != combinedPrediction.size()) {
+                         System.err.println("Warning: Target data size (" + targetData.size() + ") does not match prediction size (" + combinedPrediction.size() + "). Metrics may be inaccurate.");
+                         // Optionally truncate the longer list to match the shorter one
+                         int minSize = Math.min(targetData.size(), combinedPrediction.size());
+                         if (targetData.size() > minSize) {
+                            targetData = new ArrayList<>(targetData.subList(0, minSize));
+                         }
+                         if (combinedPrediction.size() > minSize) {
+                             combinedPrediction = new ArrayList<>(combinedPrediction.subList(0, minSize));
+                         }
+                    }
+
+                    if (!targetData.isEmpty()) {
+                        double rms = PerformanceMatrix.rmsError(targetData, combinedPrediction);
+                        double accuracy15 = PerformanceMatrix.accuracy(targetData, combinedPrediction, 0.15); // 15% tolerance
+                        double accuracy05 = PerformanceMatrix.accuracy(targetData, combinedPrediction, 0.05); // 5% tolerance
+                        double accuracy01 = PerformanceMatrix.accuracy(targetData, combinedPrediction, 0.01);
+
+                        System.out.println("Root Mean Square Error (RMSE): " + String.format("%.2f", rms));
+                        System.out.println("Accuracy (within 15% tolerance): " + String.format("%.2f%%", accuracy15 * 100));
+                        System.out.println("Accuracy (within 5% tolerance): " + String.format("%.2f%%", accuracy05 * 100));
+                        System.out.println("Accuracy (within 1% tolerance): " + String.format("%.2f%%", accuracy01 * 100));
+                    } else {
+                        System.out.println("Could not find matching target data for the prediction period. Skipping evaluation.");
+                    }
+
+                } catch (IOException e) {
+                    System.err.println("Error reading target CSV file: " + e.getMessage());
+                } catch (Exception e) {
+                    System.err.println("An error occurred during performance evaluation: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            }
+
+
+        } catch (IOException e) {
+            System.err.println("Error reading input CSV file: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("An error occurred during prediction: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void trainModelWithForgetGate(Scanner scanner) {
+        System.out.print("Enter path to the training CSV file: ");
+        String filePath = scanner.nextLine();
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        System.out.print("Enter a name for the model (e.g., 'model_forgetgate'): ");
+        String modelName = scanner.nextLine();
+
+        System.out.println("Starting training process WITH FORGET GATE...");
+
+        try {
+            ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+            LstmTrainWithForgetGate lstmTrain = new LstmTrainWithForgetGate(channelAddress, 30, filePath);
+
+            Thread trainingThread = new Thread(lstmTrain);
+            trainingThread.start();
+            trainingThread.join();
+
+            System.out.println("\n✓ Training with Forget Gate completed successfully.");
+            
+             // Display training performance summary
+            System.out.println("\n--- Training Performance Summary ---");
+            HyperParameters trainedHyperParams = ReadAndSaveModels.read(modelName);
+            ArrayList<Double> trendErrors = trainedHyperParams.getRmsErrorTrend();
+            ArrayList<Double> seasonalityErrors = trainedHyperParams.getRmsErrorSeasonality();
+
+            if (!trendErrors.isEmpty()) {
+                System.out.println("Final Trend Validation RMSE: " + String.format("%.4f", trendErrors.get(trendErrors.size() - 1)));
+            }
+            if (!seasonalityErrors.isEmpty()) {
+                    System.out.println("Final Seasonality Validation RMSE: " + String.format("%.4f", seasonalityErrors.get(seasonalityErrors.size() - 1)));
+            }
+
+        } catch (InterruptedException e) {
+            System.err.println("\n✗ Training was interrupted.");
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            System.err.println("\n✗ An error occurred during training: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void predictCombinedImproved(Scanner scanner) {
+        System.out.print("Enter the name of the model to use: ");
+        String modelName = scanner.nextLine();
+
+        System.out.print("Enter path to the input CSV file for prediction context: ");
+        String filePath = scanner.nextLine();
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        try {
+            HyperParameters hyperParameters = ReadAndSaveModels.read(modelName);
+            if (hyperParameters.getCount() == 0) {
+                System.out.println("Model has not been trained yet. Please train the model first.");
+                return;
+            }
+
+            CsvDataReader reader = new CsvDataReader();
+            TimeSeriesData allInputData = reader.read(filePath);
+
+            if (allInputData.dates().isEmpty()) {
+                System.out.println("Input data is empty. Cannot make a prediction.");
+                return;
+            }
+
+            OffsetDateTime till = allInputData.dates().get(allInputData.dates().size() - 1);
+
+            // 1. Precisely slice data and get Trend Prediction
+            System.out.println("\n--- Trend Prediction (Improved) ---");
+            OffsetDateTime trendFrom = till.minusMinutes((long) hyperParameters.getInterval() * hyperParameters.getWindowSizeTrend());
+            TimeSeriesData trendInput = filterDataByDateRange(allInputData, trendFrom, till);
+            
+            // Use LstmPredictorImproved
+            ArrayList<Double> trendPrediction = LstmPredictorImproved.predictTrend(
+                    trendInput.values(),
+                    trendInput.dates(),
+                    till.atZoneSameInstant(ZoneId.systemDefault()),
+                    hyperParameters);
+            System.out.println("Predicted trend values (first 10): " + trendPrediction.subList(0, Math.min(10, trendPrediction.size())));
+
+            // 2. Precisely slice data and get Seasonality Prediction
+            System.out.println("\n--- Seasonality Prediction (Improved) ---");
+            OffsetDateTime seasonalityFrom = till.minusDays((long)hyperParameters.getWindowSizeSeasonality() - 1);
+            TimeSeriesData seasonalityInput = filterDataByDateRange(allInputData, seasonalityFrom, till);
+
+            // Use LstmPredictorImproved
+            ArrayList<Double> seasonalityPrediction = LstmPredictorImproved.predictSeasonality(
+                    seasonalityInput.values(),
+                    seasonalityInput.dates(),
+                    hyperParameters);
+
+            // 3. Arrange the seasonality prediction to align it correctly in time
+            OffsetDateTime targetFrom = till.plusMinutes(hyperParameters.getInterval());
+            int splitIndex = LstmPredictorImproved.getIndex(targetFrom.getHour(), targetFrom.getMinute(), hyperParameters);
+            ArrayList<Double> arrangedSeasonality = LstmPredictorImproved.getArranged(splitIndex, seasonalityPrediction);
+
+
+            // 4. Combine Trend and Arranged Seasonality
+            ArrayList<Double> combinedPrediction = DataUtility.combine(trendPrediction, arrangedSeasonality);
+            System.out.println("\n--- Combined Final Prediction ---");
+            System.out.println("Final predicted values (first 10): " + combinedPrediction.subList(0, Math.min(10, combinedPrediction.size())));
+
+            // 5. Performance Evaluation
+             System.out.print("\nEnter path to validation/target CSV file to evaluate performance (or press Enter to skip): ");
+            String targetFilePath = scanner.nextLine();
+
+            if (targetFilePath != null && !targetFilePath.trim().isEmpty()) {
+                if (!targetFilePath.contains(":\\") && !targetFilePath.startsWith("/")) {
+                    targetFilePath = "D:\\GGP\\LSTM_Java\\" + targetFilePath;
+                }
+                
+                System.out.println("\n--- Performance Evaluation ---");
+                try {
+                    OffsetDateTime predictionEnd = targetFrom.plusMinutes((long) hyperParameters.getInterval() * (combinedPrediction.size() -1));
+                    ArrayList<Double> targetData = getTargetDataForPrediction(targetFrom, predictionEnd.plusMinutes(1), targetFilePath, hyperParameters);
+
+                    if (targetData.size() != combinedPrediction.size()) {
+                         int minSize = Math.min(targetData.size(), combinedPrediction.size());
+                         if (targetData.size() > minSize) targetData = new ArrayList<>(targetData.subList(0, minSize));
+                         if (combinedPrediction.size() > minSize) combinedPrediction = new ArrayList<>(combinedPrediction.subList(0, minSize));
+                    }
+
+                    if (!targetData.isEmpty()) {
+                        double rms = PerformanceMatrix.rmsError(targetData, combinedPrediction);
+                        double accuracy15 = PerformanceMatrix.accuracy(targetData, combinedPrediction, 0.15);
+                        double accuracy05 = PerformanceMatrix.accuracy(targetData, combinedPrediction, 0.05);
+
+                        System.out.println("Root Mean Square Error (RMSE): " + String.format("%.2f", rms));
+                        System.out.println("Accuracy (within 15% tolerance): " + String.format("%.2f%%", accuracy15 * 100));
+                        System.out.println("Accuracy (within 5% tolerance): " + String.format("%.2f%%", accuracy05 * 100));
+                    } else {
+                        System.out.println("Could not find matching target data for the prediction period. Skipping evaluation.");
+                    }
+
+                } catch (IOException e) {
+                    System.err.println("Error reading target CSV file: " + e.getMessage());
+                } catch (Exception e) {
+                    System.err.println("An error occurred during performance evaluation: " + e.getMessage());
+                }
+            }
+
+
+        } catch (IOException e) {
+            System.err.println("Error reading input CSV file: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("An error occurred during prediction: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void trainWithSlidingWindowImproved(Scanner scanner) {
+        System.out.print("Enter path to the training CSV file: ");
+        String filePath = scanner.nextLine();
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        System.out.print("Enter a name for the model (e.g., 'model_sliding_improved'): ");
+        String modelName = scanner.nextLine();
+
+        System.out.print("Enter starting month (1-12): ");
+        int startMonth = Integer.parseInt(scanner.nextLine());
+
+        System.out.print("Enter ending month (1-12): ");
+        int endMonth = Integer.parseInt(scanner.nextLine());
+
+        try {
+            CsvDataReader reader = new CsvDataReader();
+            TimeSeriesData allData = reader.read(filePath);
+
+            if (allData.dates().isEmpty()) {
+                System.err.println("No data found in the file.");
+                return;
+            }
+
+            OffsetDateTime processStartDate = null;
+            for (OffsetDateTime date : allData.dates()) {
+                if (date.getMonthValue() >= startMonth) {
+                    processStartDate = date;
+                    break;
+                }
+            }
+
+            OffsetDateTime processEndDate = null;
+            for (int i = allData.dates().size() - 1; i >= 0; i--) {
+                OffsetDateTime date = allData.dates().get(i);
+                if (date.getMonthValue() <= endMonth) {
+                    // Lấy thời điểm cuối cùng của ngày đó để đảm bảo bao trọn
+                    processEndDate = date.toLocalDate().atTime(23, 59, 59).atZone(date.getOffset()).toOffsetDateTime();
+                    break;
+                }
+            }
+
+            if (processStartDate == null || processEndDate == null || processStartDate.isAfter(processEndDate)) {
+                System.err.println("Could not find data within the specified month range (" + startMonth + "-" + endMonth + ").");
+                return;
+            }
+
+            System.out.println("\nStarting IMPROVED sliding window training...");
+            System.out.println("Data range: " + processStartDate.toLocalDate() + " to " + processEndDate.toLocalDate());
+            System.out.println("Model name: " + modelName);
+
+            OffsetDateTime windowStart = processStartDate;
+            int iteration = 1;
+            String tempFilePath = "temp_sliding_window_train_improved.csv";
+
+            while (true) {
+                OffsetDateTime windowEnd = windowStart.plusDays(45);
+                if (windowEnd.isAfter(processEndDate)) {
+                    System.out.println("\nWindow end (" + windowEnd.toLocalDate() + ") extends beyond the process end date (" + processEndDate.toLocalDate() + "). Stopping.");
+                    break;
+                }
+
+                TimeSeriesData windowData = filterDataByDateRange(allData, windowStart, windowEnd);
+
+                if (windowData.dates().isEmpty() || windowData.dates().size() < 2) {
+                     System.out.println("Skipping iteration " + iteration + ": Not enough data in window " + windowStart.toLocalDate() + " to " + windowEnd.toLocalDate());
+                     windowStart = windowStart.plusDays(7); // Trượt cửa sổ
+                     iteration++;
+                     continue;
+                }
+
+                writeTimeSeriesToCsv(windowData, tempFilePath);
+
+                System.out.println("\n╔════════════════════════════════════════╗");
+                System.out.println("║ Iteration " + iteration + ": " + windowStart.toLocalDate() + " -> " + windowEnd.toLocalDate());
+                System.out.println("╚════════════════════════════════════════╝");
+
+                try {
+                    ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+                    // Use LstmTrainImproved here
+                    LstmTrainImproved lstmTrain = new LstmTrainImproved(channelAddress, 30, tempFilePath);
+
+                    Thread trainingThread = new Thread(lstmTrain);
+                    trainingThread.start();
+                    trainingThread.join();
+
+                    System.out.println("✓ Iteration " + iteration + " completed successfully.");
+
+                } catch (InterruptedException e) {
+                    System.err.println("✗ Iteration " + iteration + " was interrupted.");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("✗ Iteration " + iteration + " failed: " + e.getMessage());
+                     System.out.print("Continue with next iteration? (y/n): ");
+                    if (!scanner.nextLine().equalsIgnoreCase("y")) {
+                        break;
+                    }
+                }
+
+                windowStart = windowStart.plusDays(7);
+                iteration++;
+            }
+
+            new File(tempFilePath).delete();
+            System.out.println("\n✓ Improved Sliding window training finished.");
+
+        } catch (IOException e) {
+            System.err.println("An error occurred: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void trainWithSlidingWindowWithForgetGate(Scanner scanner) {
+        System.out.print("Enter path to the training CSV file: ");
+        String filePath = scanner.nextLine();
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        System.out.print("Enter a name for the model (e.g., 'model_sliding_forgetgate'): ");
+        String modelName = scanner.nextLine();
+
+        System.out.print("Enter starting month (1-12): ");
+        int startMonth = Integer.parseInt(scanner.nextLine());
+
+        System.out.print("Enter ending month (1-12): ");
+        int endMonth = Integer.parseInt(scanner.nextLine());
+
+        try {
+            CsvDataReader reader = new CsvDataReader();
+            TimeSeriesData allData = reader.read(filePath);
+
+            if (allData.dates().isEmpty()) {
+                System.err.println("No data found in the file.");
+                return;
+            }
+
+            OffsetDateTime processStartDate = null;
+            for (OffsetDateTime date : allData.dates()) {
+                if (date.getMonthValue() >= startMonth) {
+                    processStartDate = date;
+                    break;
+                }
+            }
+
+            OffsetDateTime processEndDate = null;
+            for (int i = allData.dates().size() - 1; i >= 0; i--) {
+                OffsetDateTime date = allData.dates().get(i);
+                if (date.getMonthValue() <= endMonth) {
+                    processEndDate = date.toLocalDate().atTime(23, 59, 59).atZone(date.getOffset()).toOffsetDateTime();
+                    break;
+                }
+            }
+
+            if (processStartDate == null || processEndDate == null || processStartDate.isAfter(processEndDate)) {
+                System.err.println("Could not find data within the specified month range (" + startMonth + "-" + endMonth + ").");
+                return;
+            }
+
+            System.out.println("\nStarting SLIDING WINDOW training WITH FORGET GATE...");
+            System.out.println("Data range: " + processStartDate.toLocalDate() + " to " + processEndDate.toLocalDate());
+            System.out.println("Model name: " + modelName);
+
+            OffsetDateTime windowStart = processStartDate;
+            int iteration = 1;
+            String tempFilePath = "temp_sliding_window_train_forgetgate.csv";
+
+            while (true) {
+                OffsetDateTime windowEnd = windowStart.plusDays(45);
+                if (windowEnd.isAfter(processEndDate)) {
+                    System.out.println("\nWindow end (" + windowEnd.toLocalDate() + ") extends beyond the process end date (" + processEndDate.toLocalDate() + "). Stopping.");
+                    break;
+                }
+
+                TimeSeriesData windowData = filterDataByDateRange(allData, windowStart, windowEnd);
+
+                if (windowData.dates().isEmpty() || windowData.dates().size() < 2) {
+                     System.out.println("Skipping iteration " + iteration + ": Not enough data in window " + windowStart.toLocalDate() + " to " + windowEnd.toLocalDate());
+                     windowStart = windowStart.plusDays(7);
+                     iteration++;
+                     continue;
+                }
+
+                writeTimeSeriesToCsv(windowData, tempFilePath);
+
+                System.out.println("\n╔════════════════════════════════════════╗");
+                System.out.println("║ Iteration " + iteration + ": " + windowStart.toLocalDate() + " -> " + windowEnd.toLocalDate());
+                System.out.println("╚════════════════════════════════════════╝");
+
+                try {
+                    ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+                    LstmTrainWithForgetGate lstmTrain = new LstmTrainWithForgetGate(channelAddress, 30, tempFilePath);
+
+                    Thread trainingThread = new Thread(lstmTrain);
+                    trainingThread.start();
+                    trainingThread.join();
+
+                    System.out.println("✓ Iteration " + iteration + " completed successfully.");
+
+                } catch (InterruptedException e) {
+                    System.err.println("✗ Iteration " + iteration + " was interrupted.");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("✗ Iteration " + iteration + " failed: " + e.getMessage());
+                     System.out.print("Continue with next iteration? (y/n): ");
+                    if (!scanner.nextLine().equalsIgnoreCase("y")) {
+                        break;
+                    }
+                }
+
+                windowStart = windowStart.plusDays(7);
+                iteration++;
+            }
+
+            new File(tempFilePath).delete();
+            System.out.println("\n✓ Sliding window training with Forget Gate finished.");
+
+        } catch (IOException e) {
+            System.err.println("An error occurred: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private static void trainModelImproved(Scanner scanner) {
+        System.out.print("Enter path to the training CSV file: ");
+        String filePath = scanner.nextLine();
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+        }
+
+        System.out.print("Enter a name for the model (e.g., 'model01_improved'): ");
+        String modelName = scanner.nextLine();
+
+        System.out.println("Starting IMPROVED training process (Fixed Dropout, Gradients, Adagrad)...");
+
+        try {
+            ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+            LstmTrainImproved lstmTrain = new LstmTrainImproved(channelAddress, 30, filePath);
+
+            Thread trainingThread = new Thread(lstmTrain);
+            trainingThread.start();
+            trainingThread.join();
+
+            System.out.println("\n✓ Improved Training completed successfully.");
+            
+             // Display training performance summary
+            System.out.println("\n--- Training Performance Summary ---");
+            HyperParameters trainedHyperParams = ReadAndSaveModels.read(modelName);
+            ArrayList<Double> trendErrors = trainedHyperParams.getRmsErrorTrend();
+            ArrayList<Double> seasonalityErrors = trainedHyperParams.getRmsErrorSeasonality();
+
+            if (!trendErrors.isEmpty()) {
+                System.out.println("Final Trend Validation RMSE: " + String.format("%.4f", trendErrors.get(trendErrors.size() - 1)));
+            }
+            if (!seasonalityErrors.isEmpty()) {
+                    System.out.println("Final Seasonality Validation RMSE: " + String.format("%.4f", seasonalityErrors.get(seasonalityErrors.size() - 1)));
+            }
+
+        } catch (InterruptedException e) {
+            System.err.println("\n✗ Training was interrupted.");
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            System.err.println("\n✗ An error occurred during training: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+
+     * Train model liên tiếp từ tháng 1 đến tháng 9
+
+     */
+
+    private static void trainSequentialMonths(Scanner scanner) {
+
+        System.out.print("Enter base path to data folder (e.g., D:\\GGP\\LSTM_Java\\): ");
+
+        String basePath = scanner.nextLine();
+
+        if (!basePath.endsWith("\\") && !basePath.endsWith("/")) {
+
+            basePath += "\\";
+
+        }
+
+
+
+        System.out.print("Enter model name to use/create: ");
+
+        String modelName = scanner.nextLine();
+
+
+
+        System.out.print("Enter starting month (1-9): ");
+
+        int startMonth = Integer.parseInt(scanner.nextLine());
+
+
+
+        System.out.print("Enter ending month (1-9): ");
+
+        int endMonth = Integer.parseInt(scanner.nextLine());
+
+
+
+        if (startMonth < 1 || startMonth > 9 || endMonth < 1 || endMonth > 9 || startMonth > endMonth) {
+
+            System.err.println("Invalid month range. Please use 1-9.");
+
+            return;
+
+        }
+
+
+
+        System.out.print("Enter file naming pattern (e.g., 'data_t' for data_t1.csv, data_t2.csv, ...): ");
+
+        String filePattern = scanner.nextLine();
+
+
+
+        System.out.println("\n========================================");
+
+        System.out.println("Sequential Training Configuration");
+
+        System.out.println("========================================");
+
+        System.out.println("Base Path: " + basePath);
+
+        System.out.println("Model Name: " + modelName);
+
+        System.out.println("Training Months: T" + startMonth + " to T" + endMonth);
+
+        System.out.println("File Pattern: " + filePattern + "X.csv");
+
+        System.out.println("========================================\n");
+
+
+
+        System.out.print("Proceed with training? (y/n): ");
+
+        String confirm = scanner.nextLine();
+
+        if (!confirm.equalsIgnoreCase("y")) {
+
+            System.out.println("Training cancelled.");
+
+            return;
+
+        }
+
+
+
+        int successCount = 0;
+
+        int failCount = 0;
+
+
+
+        long startTime = System.currentTimeMillis();
+
+
+
+        for (int month = startMonth; month <= endMonth; month++) {
+
+            String fileName = filePattern + month + ".csv";
+
+            String fullPath = basePath + fileName;
+
+
+
+            System.out.println("\n╔════════════════════════════════════════╗");
+
+            System.out.println("║  Training Month " + month + " (" + (month - startMonth + 1) + "/" + (endMonth - startMonth + 1) + ")");
+
+            System.out.println("╚════════════════════════════════════════╝");
+
+            System.out.println("File: " + fileName);
+
+            System.out.println("Time: " + java.time.LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
+
+
+            try {
+
+                ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+
+                LstmTrain lstmTrain = new LstmTrain(channelAddress, 30, fullPath);
+
+
+
+                Thread trainingThread = new Thread(lstmTrain);
+
+                trainingThread.start();
+
+                trainingThread.join();
+
+
+
+                successCount++;
+
+                System.out.println("✓ Month " + month + " completed successfully");
+
+
+
+            } catch (InterruptedException e) {
+
+                System.err.println("✗ Month " + month + " was interrupted");
+
+                failCount++;
+
+                Thread.currentThread().interrupt();
+
+                break; // Dừng training nếu bị interrupt
+
+            } catch (Exception e) {
+
+                System.err.println("✗ Month " + month + " failed: " + e.getMessage());
+
+                failCount++;
+
+
+
+                System.out.print("\nContinue with next month? (y/n): ");
+
+                String continueChoice = scanner.nextLine();
+
+                if (!continueChoice.equalsIgnoreCase("y")) {
+
+                    break;
+
+                }
+
+            }
+
+        }
+
+
+
+        long endTime = System.currentTimeMillis();
+
+        long duration = (endTime - startTime) / 1000;
+
+
+
+        System.out.println("\n╔════════════════════════════════════════╗");
+
+        System.out.println("║      Sequential Training Summary       ║");
+
+        System.out.println("╚════════════════════════════════════════╝");
+
+        System.out.println("Model: " + modelName);
+
+                System.out.println("Successful: " + successCount + " months");
+
+                System.out.println("Failed: " + failCount + " months");
+
+                System.out.println("Total time: " + duration + " seconds (" + (duration / 60) + " minutes)");
+
+                System.out.println("Average per month: " + (successCount > 0 ? duration / successCount : 0) + " seconds");
+
+                
+
+                // NEW: Display final training performance
+
+                System.out.println("\n--- Final Model Performance ---");
+
+                HyperParameters trainedHyperParams = ReadAndSaveModels.read(modelName);
+
+                ArrayList<Double> trendErrors = trainedHyperParams.getRmsErrorTrend();
+
+                ArrayList<Double> seasonalityErrors = trainedHyperParams.getRmsErrorSeasonality();
+
+        
+
+                if (!trendErrors.isEmpty()) {
+
+                    System.out.println("Final Trend Validation RMSE: " + String.format("%.4f", trendErrors.get(trendErrors.size() - 1)));
+
+                } else {
+
+                    System.out.println("Trend performance data not available.");
+
+                }
+
+                if (!seasonalityErrors.isEmpty()) {
+
+                     System.out.println("Final Seasonality Validation RMSE: " + String.format("%.4f", seasonalityErrors.get(seasonalityErrors.size() - 1)));
+
+                } else {
+
+                    System.out.println("Seasonality performance data not available.");
+
+                }
+
+        
+
+                System.out.println("========================================\n");
+
+            }
+
+
+
+    private static void trainModel(Scanner scanner) {
+
+        System.out.print("Enter path to the training CSV file: ");
+
+        String filePath = scanner.nextLine();
+
+
+
+        // Hỗ trợ cả đường dẫn tuyệt đối và tương đối
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+
+        }
+
+
+
+        System.out.print("Enter a name for the model (e.g., 'model01'): ");
+
+        String modelName = scanner.nextLine();
+
+
+
+        System.out.println("Starting training process...");
+
+
+
+        try {
+
+            ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+
+            LstmTrain lstmTrain = new LstmTrain(channelAddress, 30, filePath);
+
+
+
+            Thread trainingThread = new Thread(lstmTrain);
+
+                        trainingThread.start();
+
+                        trainingThread.join();
+
+            
+
+                        System.out.println("\n✓ Training completed successfully.");
+
+            
+
+                        // NEW: Display training performance summary
+
+                        System.out.println("\n--- Training Performance Summary ---");
+
+                        HyperParameters trainedHyperParams = ReadAndSaveModels.read(modelName);
+
+                        ArrayList<Double> trendErrors = trainedHyperParams.getRmsErrorTrend();
+
+                        ArrayList<Double> seasonalityErrors = trainedHyperParams.getRmsErrorSeasonality();
+
+            
+
+                        if (!trendErrors.isEmpty()) {
+
+                            System.out.println("Final Trend Validation RMSE: " + String.format("%.4f", trendErrors.get(trendErrors.size() - 1)));
+
+                        } else {
+
+                            System.out.println("Trend performance data not available.");
+
+                        }
+
+                        if (!seasonalityErrors.isEmpty()) {
+
+                             System.out.println("Final Seasonality Validation RMSE: " + String.format("%.4f", seasonalityErrors.get(seasonalityErrors.size() - 1)));
+
+                        } else {
+
+                            System.out.println("Seasonality performance data not available.");
+
+                        }
+
+            
+
+                    } catch (InterruptedException e) {
+
+            System.err.println("\n✗ Training was interrupted.");
+
+            Thread.currentThread().interrupt();
+
+        } catch (Exception e) {
+
+            System.err.println("\n✗ An error occurred during training: " + e.getMessage());
+
+            e.printStackTrace();
+
+        }
+
+    }
+
+
+
+    private static void predict(Scanner scanner) {
+
+        System.out.print("Enter the name of the model to use: ");
+
+        String modelName = scanner.nextLine();
+
+
+
+        System.out.print("Enter path to the input CSV file for prediction: ");
+
+        String filePath = scanner.nextLine();
+
+
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+
+        }
+
+
+
+        try {
+
+            HyperParameters hyperParameters = ReadAndSaveModels.read(modelName);
+
+            if (hyperParameters.getCount() == 0) {
+
+                System.out.println("Model has not been trained yet. Please train the model first.");
+
+                return;
+
+            }
+
+
+
+            CsvDataReader reader = new CsvDataReader();
+
+            TimeSeriesData predictionInput = reader.read(filePath);
+
+
+
+            System.out.println("\n--- Trend Prediction ---");
+
+            ArrayList<Double> trendPrediction = LstmPredictor.predictTrend(
+
+                    predictionInput.values(),
+
+                    predictionInput.dates(),
+
+                    predictionInput.dates().get(predictionInput.dates().size() - 1).atZoneSameInstant(ZoneId.systemDefault()),
+
+                    hyperParameters);
+
+            System.out.println("Predicted values: " + trendPrediction);
+
+
+
+            System.out.println("\n--- Seasonality Prediction ---");
+
+            ArrayList<Double> seasonalityPrediction = LstmPredictor.predictSeasonality(
+
+                    predictionInput.values(),
+
+                    predictionInput.dates(),
+
+                    hyperParameters);
+
+            System.out.println("Predicted values: " + seasonalityPrediction);
+
+
+
+        } catch (IOException e) {
+
+            System.err.println("Error reading input CSV file: " + e.getMessage());
+
+        } catch (Exception e) {
+
+            System.err.println("An error occurred during prediction: " + e.getMessage());
+
+            e.printStackTrace();
+
+        }
+
+    }
+
+
+
+    private static void predictMonth(Scanner scanner) {
+
+        System.out.print("Enter the name of the model to use: ");
+
+        String modelName = scanner.nextLine();
+
+
+
+        System.out.print("Enter path to the input CSV file for context: ");
+
+        String filePath = scanner.nextLine();
+
+
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+
+        }
+
+
+
+        System.out.print("Enter path for the output CSV file: ");
+
+        String outputPath = scanner.nextLine();
+
+
+
+        if (!outputPath.contains(":\\") && !outputPath.startsWith("/")) {
+
+            outputPath = "D:\\GGP\\LSTM_Java\\" + outputPath;
+
+        }
+
+
+
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(outputPath))) {
+
+            HyperParameters hyperParameters = ReadAndSaveModels.read(modelName);
+
+            if (hyperParameters.getCount() == 0) {
+
+                System.out.println("Model has not been trained yet. Please train the model first.");
+
+                return;
+
+            }
+
+
+
+            CsvDataReader reader = new CsvDataReader();
+
+            TimeSeriesData predictionInput = reader.read(filePath);
+
+
+
+            if (predictionInput.dates().isEmpty()) {
+
+                System.out.println("Input data is empty. Cannot make a prediction.");
+
+                return;
+
+            }
+
+
+
+            System.out.println("\nGenerating monthly forecast...");
+
+
+
+            ArrayList<Double> currentValues = new ArrayList<>(predictionInput.values());
+
+            ArrayList<OffsetDateTime> currentDates = new ArrayList<>(predictionInput.dates());
+
+
+
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+            writer.write("day,load_kW\n");
+
+
+
+            System.out.println("\n--- Monthly Forecast (30 days) ---");
+
+
+
+            // Lặp qua 30 ngày
+
+            for (int day = 0; day < 30; day++) {
+
+                ArrayList<Double> dayPrediction = LstmPredictor.predictSeasonality(
+
+                        currentValues,
+
+                        currentDates,
+
+                        hyperParameters);
+
+
+
+                if (dayPrediction.isEmpty()) {
+
+                    System.out.println("Could not generate prediction for day " + (day + 1));
+
+                    break;
+
+                }
+
+
+
+                OffsetDateTime lastDate = currentDates.get(currentDates.size() - 1);
+
+                int interval = hyperParameters.getInterval();
+
+
+
+                for (int i = 0; i < dayPrediction.size(); i++) {
+
+                    long minutesToAdd = (long) (i + 1) * interval;
+
+                    OffsetDateTime newTimestamp = lastDate.plusMinutes(minutesToAdd);
+
+
+
+                    double predictedValue = dayPrediction.get(i);
+
+
+
+                    String line = String.format("%s,%.1f",
+
+                            newTimestamp.format(formatter), predictedValue);
+
+                    writer.write(line + "\n");
+
+
+
+                    currentValues.add(predictedValue);
+
+                    currentDates.add(newTimestamp);
+
+                }
+
+
+
+                int maxHistorySize = 7 * 24 * (60 / interval); // 7 ngày
+
+                if (currentValues.size() > maxHistorySize) {
+
+                    int excess = currentValues.size() - maxHistorySize;
+
+                    currentValues.subList(0, excess).clear();
+
+                    currentDates.subList(0, excess).clear();
+
+                }
+
+
+
+                if ((day + 1) % 5 == 0) {
+
+                    System.out.println("Progress: " + (day + 1) + "/30 days completed");
+
+                }
+
+            }
+
+
+
+            System.out.println("\n✓ Forecast saved to " + outputPath);
+
+
+
+        } catch (IOException e) {
+
+            System.err.println("Error reading input or writing output file: " + e.getMessage());
+
+        } catch (Exception e) {
+
+            System.err.println("An error occurred during prediction: " + e.getMessage());
+
+            e.printStackTrace();
+
+        }
+
+    }
+
+
+
+    private static void trainWithSlidingWindow(Scanner scanner) {
+
+        System.out.print("Enter path to the training CSV file: ");
+
+        String filePath = scanner.nextLine();
+
+        if (!filePath.contains(":\\") && !filePath.startsWith("/")) {
+
+            filePath = "D:\\GGP\\LSTM_Java\\" + filePath;
+
+        }
+        System.out.print("Enter a name for the model (e.g., 'model_sliding'): ");
+        String modelName = scanner.nextLine();
+        System.out.print("Enter starting month (1-12): ");
+
+        int startMonth = Integer.parseInt(scanner.nextLine());
+        System.out.print("Enter ending month (1-12): ");
+        int endMonth = Integer.parseInt(scanner.nextLine());
+
+        try {
+            CsvDataReader reader = new CsvDataReader();
+            TimeSeriesData allData = reader.read(filePath);
+            if (allData.dates().isEmpty()) {
+                System.err.println("No data found in the file.");
+                return;
+            }
+            OffsetDateTime processStartDate = null;
+            for (OffsetDateTime date : allData.dates()) {
+                if (date.getMonthValue() >= startMonth) {
+                    processStartDate = date;
+                    break;
+                }
+            }
+            OffsetDateTime processEndDate = null;
+            for (int i = allData.dates().size() - 1; i >= 0; i--) {
+                OffsetDateTime date = allData.dates().get(i);
+                if (date.getMonthValue() <= endMonth) {
+                    // Lấy thời điểm cuối cùng của ngày đó để đảm bảo bao trọn
+                    processEndDate = date.toLocalDate().atTime(23, 59, 59).atZone(date.getOffset()).toOffsetDateTime();
+                    break;
+                }
+            }
+            if (processStartDate == null || processEndDate == null || processStartDate.isAfter(processEndDate)) {
+                System.err.println("Could not find data within the specified month range (" + startMonth + "-" + endMonth + ").");
+                return;
+            }
+            System.out.println("\nStarting sliding window training...");
+            System.out.println("Data range: " + processStartDate.toLocalDate() + " to " + processEndDate.toLocalDate());
+            System.out.println("Model name: " + modelName);
+            OffsetDateTime windowStart = processStartDate;
+            int iteration = 1;
+            String tempFilePath = "temp_sliding_window_train.csv";
+            while (true) {
+                OffsetDateTime windowEnd = windowStart.plusDays(45);
+                if (windowEnd.isAfter(processEndDate)) {
+                    System.out.println("\nWindow end (" + windowEnd.toLocalDate() + ") extends beyond the process end date (" + processEndDate.toLocalDate() + "). Stopping.");
+                    break;
+                }
+                TimeSeriesData windowData = filterDataByDateRange(allData, windowStart, windowEnd);
+                if (windowData.dates().isEmpty() || windowData.dates().size() < 2) {
+                     System.out.println("Skipping iteration " + iteration + ": Not enough data in window " + windowStart.toLocalDate() + " to " + windowEnd.toLocalDate());
+                     windowStart = windowStart.plusDays(7); // Trượt cửa sổ
+                     iteration++;
+                     continue;
+                }
+                writeTimeSeriesToCsv(windowData, tempFilePath);
+                System.out.println("\n╔════════════════════════════════════════╗");
+                System.out.println("║ Iteration " + iteration + ": " + windowStart.toLocalDate() + " -> " + windowEnd.toLocalDate());
+                System.out.println("╚════════════════════════════════════════╝");
+                try {
+                    ChannelAddress channelAddress = new ChannelAddress("component0", modelName);
+                    LstmTrain lstmTrain = new LstmTrain(channelAddress, 30, tempFilePath);
+                    Thread trainingThread = new Thread(lstmTrain);
+                    trainingThread.start();
+                    trainingThread.join();
+                    System.out.println("✓ Iteration " + iteration + " completed successfully.");
+                } catch (InterruptedException e) {
+                    System.err.println("✗ Iteration " + iteration + " was interrupted.");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("✗ Iteration " + iteration + " failed: " + e.getMessage());
+                     System.out.print("Continue with next iteration? (y/n): ");
+                    if (!scanner.nextLine().equalsIgnoreCase("y")) {
+                        break;
+                    }
+                }
+                windowStart = windowStart.plusDays(7);
+                iteration++;
+            }
+            new File(tempFilePath).delete();
+            System.out.println("\n✓ Sliding window training finished.");
+        } catch (IOException e) {
+            System.err.println("An error occurred: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static TimeSeriesData filterDataByDateRange(TimeSeriesData source, OffsetDateTime start, OffsetDateTime end) {
+
+        ArrayList<OffsetDateTime> filteredDates = new ArrayList<>();
+
+        ArrayList<Double> filteredValues = new ArrayList<>();
+
+        for (int i = 0; i < source.dates().size(); i++) {
+
+            OffsetDateTime currentDate = source.dates().get(i);
+
+            if (!currentDate.isBefore(start) && currentDate.isBefore(end)) {
+
+                filteredDates.add(currentDate);
+
+                filteredValues.add(source.values().get(i));
+
+            }
+
+        }
+
+        return new TimeSeriesData(filteredDates, filteredValues);
+
+    }
+
+
+
+        private static ArrayList<Double> getTargetDataForPrediction(OffsetDateTime from, OffsetDateTime to, String csvFilePath, HyperParameters hyperParameters) throws IOException {
+
+
+
+            CsvDataReader reader = new CsvDataReader();
+
+
+
+            TimeSeriesData allTargetData = reader.read(csvFilePath);
+
+
+
+    
+
+
+
+            ArrayList<Double> filteredValues = new ArrayList<>();
+
+
+
+            ArrayList<OffsetDateTime> filteredDates = new ArrayList<>();
+
+
+
+    
+
+
+
+            for (int i = 0; i < allTargetData.dates().size(); i++) {
+
+
+
+                OffsetDateTime currentDate = allTargetData.dates().get(i);
+
+
+
+                if (!currentDate.isBefore(from) && currentDate.isBefore(to)) {
+
+
+
+                    filteredDates.add(currentDate);
+
+
+
+                    filteredValues.add(allTargetData.values().get(i));
+
+
+
+                }
+
+
+
+            }
+
+
+
+    
+
+
+
+            TimeSeriesData targetDataInPeriod = new TimeSeriesData(filteredDates, filteredValues);
+
+
+
+            TimeSeriesData regularizedTarget = TimeIndexRegularizer.regularize(targetDataInPeriod.dates(), targetDataInPeriod.values(), hyperParameters.getInterval());
+
+
+
+    
+
+
+
+            InterpolationManager interpolation = new InterpolationManager(regularizedTarget.values(), hyperParameters);
+
+
+
+            return interpolation.getInterpolatedData();
+
+
+
+        }
+
+
+
+    
+
+
+
+        private static void writeTimeSeriesToCsv(TimeSeriesData data, String filePath) throws IOException {
+
+
+
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(filePath))) {
+
+
+
+                writer.write("day,load_kW\n");
+
+
+
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+
+
+    
+
+
+
+                for (int i = 0; i < data.dates().size(); i++) {
+
+
+
+                    String line = String.format("%s,%.1f",
+
+
+
+                        data.dates().get(i).format(formatter), data.values().get(i));
+
+
+
+                    writer.write(line + "\n");
+
+
+
+                }
+
+
+
+            }
+
+
+
+        }
+
+
+
+    }
