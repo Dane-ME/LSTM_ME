@@ -49,6 +49,15 @@ public class LstmTrainWithForgetGate implements Runnable {
             ArrayList<OffsetDateTime> allDates = allData.dates();
             ArrayList<Double> allValues = allData.values();
 
+            if (this.days > 0) {
+                int requiredPoints = (int) (this.days * 24 * 60 / interval);
+                if (allValues.size() > requiredPoints) {
+                    int startIndex = allValues.size() - requiredPoints;
+                    allValues = new ArrayList<>(allValues.subList(startIndex, allValues.size()));
+                    allDates = new ArrayList<>(allDates.subList(startIndex, allDates.size()));
+                }
+            }
+
             int totalItems = allValues.size();
             int trainSize = (int) (totalItems * 0.66); // 66% train and 33% validation
 
